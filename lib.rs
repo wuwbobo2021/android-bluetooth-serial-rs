@@ -375,7 +375,7 @@ impl BluetoothSocket {
             .get_method_id("java/io/InputStream", "read", "([BII)I")
             .map_err(jerr)?;
         let read_size = env
-            .call_method(&socket, "getMaxTransmitPacketSize", "()Z", &[])
+            .call_method(&socket, "getMaxReceivePacketSize", "()I", &[])
             .get_int()
             .map(|i| i as usize)
             .unwrap_or(Self::ARRAY_SIZE);
