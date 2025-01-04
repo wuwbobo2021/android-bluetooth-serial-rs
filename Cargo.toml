@@ -2,6 +2,10 @@
 name = "android-bluetooth-serial"
 version = "0.1.0"
 authors = ["wuwbobo2021 <wuwbobo@outlook.com>"]
+description = "Android API wrapper handling Bluetooth classic RFCOMM/SPP connection."
+repository = "https://github.com/wuwbobo2021/android-bluetooth-serial-rs"
+readme = "README.md"
+keywords = ["bluetooth", "rfcomm", "spp", "android"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 

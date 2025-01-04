@@ -1,3 +1,10 @@
+/// Android API wrapper handling Bluetooth classic RFCOMM/SPP connection.
+///
+/// TODO:
+/// - Add a function and an enum for checking the bluetooth state.
+/// - Add functions for permission request and enabling bluetooth.
+///   <https://developer.android.com/develop/connectivity/bluetooth/setup>
+/// - Add functions for device discovery and pairing.
 use std::io::Error;
 
 use jni::{
@@ -14,6 +21,7 @@ use std::{
 };
 
 const BLUETOOTH_SERVICE: &str = "bluetooth";
+pub const SPP_UUID: &str = "00001101-0000-1000-8000-00805F9B34FB";
 
 /// Maps unexpected JNI errors to `std::io::Error` of `ErrorKind::Other`
 /// (`From<jni::errors::Error>` cannot be implemented for `std::io::Error`
@@ -89,8 +97,6 @@ fn get_bluetooth_adapter() -> Result<jni::objects::GlobalRef, Error> {
     }
 }
 
-// TODO: Add a function and an enum for checking the bluetooth state.
-
 /// Return true if Bluetooth is currently enabled and ready for use.
 pub fn is_enabled() -> Result<bool, Error> {
     let adapter = bluetooth_adapter()?;
@@ -99,11 +105,6 @@ pub fn is_enabled() -> Result<bool, Error> {
         .get_boolean()
         .map_err(jerr)
 }
-
-// TODO: Add a function for enabling bluetooth.
-// <https://developer.android.com/develop/connectivity/bluetooth/setup>
-
-// TODO: Add functions for device scanning.
 
 /// Gets a list of `BluetoothDevice` objects that are bonded (paired) to the adapter.
 /// Returns an empty list if `is_enabled()` is false.
@@ -138,14 +139,13 @@ pub fn get_bonded_devices() -> Result<Vec<BluetoothDevice>, Error> {
     Ok(vec)
 }
 
+/// Corresponds to `android.bluetooth.BluetoothDevice`.
 #[derive(Clone, Debug)]
 pub struct BluetoothDevice {
     pub(crate) internal: jni::objects::GlobalRef,
 }
 
 impl BluetoothDevice {
-    pub const SPP_UUID: &str = "00001101-0000-1000-8000-00805F9B34FB";
-
     /// Returns the hardware address of this BluetoothDevice.
     /// TODO: return some MAC address type instead of `String`.
     pub fn get_address(&self) -> Result<String, Error> {
@@ -171,6 +171,8 @@ impl BluetoothDevice {
         dev_name.get_string(env).map_err(jerr)
     }
 
+    /// Creates the Android Bluetooth API socket object for RFCOMM communication.
+    /// `connect` is not called automatically. `SPP_UUID` can be used.
     /// TODO: better error handling.
     pub fn build_rfcomm_socket(
         &self,
@@ -212,17 +214,17 @@ impl BluetoothDevice {
 /// because the timeout of the Java `InputStream` from the `BluetoothSocket` cannot be set.
 /// The read timeout defaults to 0 (it does not block).
 ///
-/// TODO: Improve error handling, provide some write success indicator or an `async` interface.
+/// TODO: Improve error handling, provide some write success indicator and an `async` interface.
 ///
 /// Reference:
 /// <https://developer.android.com/develop/connectivity/bluetooth/transfer-data>
-#[derive(Debug)]
 pub struct BluetoothSocket {
     internal: jni::objects::GlobalRef,
 
     input_stream: jni::objects::GlobalRef,
     buf_read: Arc<Mutex<VecDeque<u8>>>,
     thread_read: Option<JoinHandle<Result<(), Error>>>, // the returned value is unused
+    read_callback: Arc<Mutex<Box<dyn Fn(Option<usize>) + 'static + Send>>>, // no-op by default
     read_timeout: Duration,                             // set for the standard Read trait
 
     output_stream: jni::objects::GlobalRef,
@@ -237,7 +239,7 @@ impl BluetoothSocket {
     fn build(obj: jni::objects::GlobalRef) -> Result<Self, Error> {
         let env = &mut jni_attach_vm().map_err(jerr)?;
 
-        // the streams may be usable after reconnection (check Android SDK source)
+        // the streams may (or may NOT) be usable after reconnection (check Android SDK source)
         let input_stream = env
             .call_method(&obj, "getInputStream", "()Ljava/io/InputStream;", &[])
             .get_object(env)
@@ -268,6 +270,7 @@ impl BluetoothSocket {
             input_stream,
             buf_read: Arc::new(Mutex::new(VecDeque::new())),
             thread_read: None,
+            read_callback: Arc::new(Mutex::new(Box::new(|_| {}))),
             read_timeout: Duration::from_millis(0),
 
             output_stream,
@@ -287,7 +290,9 @@ impl BluetoothSocket {
 
     /// Attempts to connect to a remote device. When connected, it creates a
     /// backgrond thread for reading data, which terminates itself on disconnection.
-    /// TODO: improve error handling.
+    /// Do not reuse the socket after disconnection, because the underlying OS
+    /// implementation is probably incapable of reconnecting the device, just like
+    /// `java.net.Socket`. TODO: improve error handling.
     pub fn connect(&mut self) -> Result<(), Error> {
         if self.is_connected()? {
             return Ok(());
@@ -302,17 +307,42 @@ impl BluetoothSocket {
             .clear_ex()
             .map_err(jerr)?;
         if self.is_connected()? {
-            // self.buf_read.lock().unwrap().clear();
             let socket = self.internal.clone();
             let input_stream = self.input_stream.clone();
             let arc_buf_read = self.buf_read.clone();
+            let arc_callback = self.read_callback.clone();
             self.thread_read.replace(std::thread::spawn(move || {
-                Self::read_loop(socket, input_stream, arc_buf_read)
+                Self::read_loop(socket, input_stream, arc_buf_read, arc_callback)
             }));
             Ok(())
         } else {
             Err(Error::from(ErrorKind::NotConnected))
         }
+    }
+
+    /// Returns number of available bytes that can be read without blocking.
+    pub fn len_available(&self) -> usize {
+        self.buf_read.lock().unwrap().len()
+    }
+
+    /// Clears the managed read buffer used by the Rust side background thread.
+    pub fn clear_read_buf(&mut self) {
+        self.buf_read.lock().unwrap().clear();
+    }
+
+    /// Sets timeout for the `std::io::Read` implementation.
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = timeout;
+    }
+
+    /// Sets or replaces the callback to be invoked from the background thread when
+    /// new data becomes available or the socket is disconnected. The length of newly
+    /// arrived data instead of the length of available data in the read buffer will
+    /// be passed to the callback (or `None` if it is disconnected).
+    ///
+    /// Note: Do not set a new callback inside the callback (it causes dead lock).
+    pub fn set_read_callback(&mut self, f: impl Fn(Option<usize>) + 'static + Send) {
+        *self.read_callback.lock().unwrap() = Box::new(f);
     }
 
     /// Closes this socket and releases any system resources associated with it.
@@ -331,11 +361,6 @@ impl BluetoothSocket {
         }
         Ok(())
     }
-
-    /// Sets timeout for the `std::io::Read` implementation.
-    pub fn set_read_timeout(&mut self, timeout: Duration) {
-        self.read_timeout = timeout;
-    }
 }
 
 impl BluetoothSocket {
@@ -343,6 +368,7 @@ impl BluetoothSocket {
         socket: jni::objects::GlobalRef,
         input_stream: jni::objects::GlobalRef,
         buf_read: Arc<Mutex<VecDeque<u8>>>,
+        read_callback: Arc<Mutex<Box<dyn Fn(Option<usize>) + 'static + Send>>>,
     ) -> Result<(), Error> {
         let env = &mut jni_attach_vm().map_err(jerr)?;
         let jmethod_read = env
@@ -394,19 +420,25 @@ impl BluetoothSocket {
                 };
                 env.get_byte_array_region(&array_read, 0, tmp_read)
                     .map_err(jerr)?;
-                buf_read
-                    .lock()
-                    .map_err(|_| Error::from(ErrorKind::Other))?
-                    .write(&vec_read[..len])
-                    .unwrap();
-                // TODO: invoke the possible callback here
+                buf_read.lock().unwrap().write(&vec_read[..len]).unwrap();
+                read_callback.lock().unwrap()(Some(len));
             } else {
+                if let Some(ex) = jni_last_cleared_ex() {
+                    let ex_msg = ex.get_throwable_msg(env).unwrap().to_lowercase();
+                    if ex_msg.contains("closed") {
+                        let _ = env
+                            .call_method(&socket, "close", "()V", &[])
+                            .map_err(jni_clear_ex_ignore);
+                        read_callback.lock().unwrap()(None);
+                        return Ok(());
+                    }
+                }
                 let is_connected = env
                     .call_method(&socket, "isConnected", "()Z", &[])
                     .get_boolean()
                     .map_err(jerr)?;
                 if !is_connected {
-                    // TODO: invoke the possible callback here
+                    read_callback.lock().unwrap()(None);
                     return Ok(());
                 }
             }
@@ -425,10 +457,7 @@ impl Read for BluetoothSocket {
         let mut cnt_read = 0;
         let mut disconnected = false;
         while cnt_read < buf.len() {
-            let mut lck_buf_read = self
-                .buf_read
-                .lock()
-                .map_err(|_| Error::from(ErrorKind::Other))?;
+            let mut lck_buf_read = self.buf_read.lock().unwrap();
             if let Ok(cnt) = lck_buf_read.read(&mut buf[cnt_read..]) {
                 cnt_read += cnt;
             }
