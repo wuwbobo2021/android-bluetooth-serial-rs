@@ -377,7 +377,7 @@ impl BluetoothSocket {
         let read_size = env
             .call_method(&socket, "getMaxReceivePacketSize", "()I", &[])
             .get_int()
-            .map(|i| i as usize)
+            .map(|i| if i > 0 { i as usize } else { Self::ARRAY_SIZE })
             .unwrap_or(Self::ARRAY_SIZE);
 
         let mut vec_read = vec![0u8; read_size];
