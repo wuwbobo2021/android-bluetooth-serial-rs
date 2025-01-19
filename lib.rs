@@ -1,10 +1,14 @@
-/// Android API wrapper handling Bluetooth classic RFCOMM/SPP connection.
-///
-/// TODO:
-/// - Add a function and an enum for checking the bluetooth state.
-/// - Add functions for permission request and enabling bluetooth.
-///   <https://developer.android.com/develop/connectivity/bluetooth/setup>
-/// - Add functions for device discovery and pairing.
+//! Android API wrapper handling Bluetooth classic RFCOMM/SPP connection.
+//!
+//! This crate is looking for maintainers!
+//!
+//! TODO:
+//! - Add a function and an enum for checking the bluetooth state.
+//! - Add functions for permission request and enabling bluetooth.
+//!   <https://developer.android.com/develop/connectivity/bluetooth/setup>
+//! - Add functions for device discovery and pairing.
+//! - Provide an asynchronous interface.
+
 use std::io::Error;
 
 use jni::{
@@ -21,9 +25,11 @@ use std::{
 };
 
 const BLUETOOTH_SERVICE: &str = "bluetooth";
+
+/// The UUID for the well-known SPP profile.
 pub const SPP_UUID: &str = "00001101-0000-1000-8000-00805F9B34FB";
 
-/// Maps unexpected JNI errors to `std::io::Error` of `ErrorKind::Other`
+/// Maps unexpected JNI errors to `std::io::Error`.
 /// (`From<jni::errors::Error>` cannot be implemented for `std::io::Error`
 /// here because of the orphan rule). Side effect: `jni_last_cleared_ex()`.
 #[inline(always)]
@@ -35,7 +41,15 @@ pub(crate) fn jerr(err: jni::errors::Error) -> Error {
             .ok_or(JavaException)
             .and_then(|ex| Ok((ex, jni_attach_vm()?)))
             .and_then(|(ex, ref mut env)| Ok((ex.get_class_name(env)?, ex.get_throwable_msg(env)?)))
-            .map(|(cls, msg)| Error::other(format!("{cls}: {msg}")))
+            .map(|(cls, msg)| {
+                if cls.contains("SecurityException") {
+                    Error::new(ErrorKind::PermissionDenied, msg)
+                } else if cls.contains("IllegalArgumentException") {
+                    Error::new(ErrorKind::InvalidInput, msg)
+                } else {
+                    Error::other(format!("{cls}: {msg}"))
+                }
+            })
             .unwrap_or(Error::other(err))
     } else {
         Error::other(err)
@@ -57,7 +71,6 @@ pub(crate) fn bluetooth_adapter() -> Result<&'static JObject<'static>, Error> {
     }
 }
 
-// TODO: distinguish "unsupported on the device" and "permission denied".
 fn get_bluetooth_adapter() -> Result<jni::objects::GlobalRef, Error> {
     let env = &mut jni_attach_vm().map_err(jerr)?;
     let context = android_context();
@@ -98,6 +111,7 @@ fn get_bluetooth_adapter() -> Result<jni::objects::GlobalRef, Error> {
 }
 
 /// Return true if Bluetooth is currently enabled and ready for use.
+/// It may return an error of `std::io::ErrorKind::PermissionDenied`, or some other error.
 pub fn is_enabled() -> Result<bool, Error> {
     let adapter = bluetooth_adapter()?;
     let env = &mut jni_attach_vm().map_err(jerr)?;
@@ -107,7 +121,7 @@ pub fn is_enabled() -> Result<bool, Error> {
 }
 
 /// Gets a list of `BluetoothDevice` objects that are bonded (paired) to the adapter.
-/// Returns an empty list if `is_enabled()` is false.
+/// `is_enabled()` is checked at first; returns an empty list if it is not enabled.
 pub fn get_bonded_devices() -> Result<Vec<BluetoothDevice>, Error> {
     if !is_enabled()? {
         return Ok(Vec::new());
@@ -158,7 +172,6 @@ impl BluetoothDevice {
     }
 
     /// Gets the friendly Bluetooth name of the remote device.
-    /// It may return an error of `std::io::ErrorKind::PermissionDenied`, or some other error.
     pub fn get_name(&self) -> Result<String, Error> {
         let env = &mut jni_attach_vm().map_err(jerr)?;
         let dev_name = env
@@ -172,8 +185,7 @@ impl BluetoothDevice {
     }
 
     /// Creates the Android Bluetooth API socket object for RFCOMM communication.
-    /// `connect` is not called automatically. `SPP_UUID` can be used.
-    /// TODO: better error handling.
+    /// `SPP_UUID` can be used. Note that `connect` is not called automatically.
     pub fn build_rfcomm_socket(
         &self,
         uuid: &str,
@@ -190,7 +202,7 @@ impl BluetoothDevice {
                 &[(&uuid).into()],
             )
             .get_object(env)
-            .map_err(jerr)?; // TODO: distinguish IllegalArgumentException and others
+            .map_err(jerr)?;
 
         let method_name = if is_secure {
             "createRfcommSocketToServiceRecord"
@@ -205,16 +217,15 @@ impl BluetoothDevice {
         )
         .get_object(env)
         .globalize(env)
-        .map_err(jerr) // TODO: distinguish IOException and other unexpected exceptions
-        .and_then(|internal| BluetoothSocket::build(internal))
+        // TODO: distinguish IOException and other unexpected exceptions
+        .map_err(jerr)
+        .and_then(BluetoothSocket::build)
     }
 }
 
 /// Manages the Bluetooth socket and IO streams. It uses a read buffer and a background thread,
 /// because the timeout of the Java `InputStream` from the `BluetoothSocket` cannot be set.
 /// The read timeout defaults to 0 (it does not block).
-///
-/// TODO: Improve error handling, provide some write success indicator and an `async` interface.
 ///
 /// Reference:
 /// <https://developer.android.com/develop/connectivity/bluetooth/transfer-data>
@@ -224,7 +235,7 @@ pub struct BluetoothSocket {
     input_stream: jni::objects::GlobalRef,
     buf_read: Arc<Mutex<VecDeque<u8>>>,
     thread_read: Option<JoinHandle<Result<(), Error>>>, // the returned value is unused
-    read_callback: Arc<Mutex<Box<dyn Fn(Option<usize>) + 'static + Send>>>, // no-op by default
+    read_callback: Arc<Mutex<Option<ReadCallback>>>,    // None by default
     read_timeout: Duration,                             // set for the standard Read trait
 
     output_stream: jni::objects::GlobalRef,
@@ -232,6 +243,8 @@ pub struct BluetoothSocket {
     jmethod_flush: jni::objects::JMethodID,
     array_write: jni::objects::GlobalRef,
 }
+
+type ReadCallback = Box<dyn Fn(Option<usize>) + 'static + Send>;
 
 impl BluetoothSocket {
     const ARRAY_SIZE: usize = 32 * 1024;
@@ -270,7 +283,7 @@ impl BluetoothSocket {
             input_stream,
             buf_read: Arc::new(Mutex::new(VecDeque::new())),
             thread_read: None,
-            read_callback: Arc::new(Mutex::new(Box::new(|_| {}))),
+            read_callback: Arc::new(Mutex::new(None)),
             read_timeout: Duration::from_millis(0),
 
             output_stream,
@@ -281,6 +294,7 @@ impl BluetoothSocket {
     }
 
     /// Gets the connection status of this socket.
+    #[inline(always)]
     pub fn is_connected(&self) -> Result<bool, Error> {
         let env = &mut jni_attach_vm().map_err(jerr)?;
         env.call_method(&self.internal, "isConnected", "()Z", &[])
@@ -292,7 +306,7 @@ impl BluetoothSocket {
     /// backgrond thread for reading data, which terminates itself on disconnection.
     /// Do not reuse the socket after disconnection, because the underlying OS
     /// implementation is probably incapable of reconnecting the device, just like
-    /// `java.net.Socket`. TODO: improve error handling.
+    /// `java.net.Socket`.
     pub fn connect(&mut self) -> Result<(), Error> {
         if self.is_connected()? {
             return Ok(());
@@ -301,7 +315,7 @@ impl BluetoothSocket {
         let env = &mut jni_attach_vm().map_err(jerr)?;
 
         let _ = env
-            .call_method(&adapter, "cancelDiscovery", "()Z", &[])
+            .call_method(adapter, "cancelDiscovery", "()Z", &[])
             .clear_ex();
         env.call_method(&self.internal, "connect", "()V", &[])
             .clear_ex()
@@ -321,11 +335,13 @@ impl BluetoothSocket {
     }
 
     /// Returns number of available bytes that can be read without blocking.
+    #[inline(always)]
     pub fn len_available(&self) -> usize {
         self.buf_read.lock().unwrap().len()
     }
 
     /// Clears the managed read buffer used by the Rust side background thread.
+    #[inline(always)]
     pub fn clear_read_buf(&mut self) {
         self.buf_read.lock().unwrap().clear();
     }
@@ -339,10 +355,8 @@ impl BluetoothSocket {
     /// new data becomes available or the socket is disconnected. The length of newly
     /// arrived data instead of the length of available data in the read buffer will
     /// be passed to the callback (or `None` if it is disconnected).
-    ///
-    /// Note: Do not set a new callback inside the callback (it causes dead lock).
     pub fn set_read_callback(&mut self, f: impl Fn(Option<usize>) + 'static + Send) {
-        *self.read_callback.lock().unwrap() = Box::new(f);
+        self.read_callback.lock().unwrap().replace(Box::new(f));
     }
 
     /// Closes this socket and releases any system resources associated with it.
@@ -368,7 +382,7 @@ impl BluetoothSocket {
         socket: jni::objects::GlobalRef,
         input_stream: jni::objects::GlobalRef,
         buf_read: Arc<Mutex<VecDeque<u8>>>,
-        read_callback: Arc<Mutex<Box<dyn Fn(Option<usize>) + 'static + Send>>>,
+        read_callback: Arc<Mutex<Option<ReadCallback>>>,
     ) -> Result<(), Error> {
         let env = &mut jni_attach_vm().map_err(jerr)?;
         let jmethod_read = env
@@ -377,7 +391,14 @@ impl BluetoothSocket {
         let read_size = env
             .call_method(&socket, "getMaxReceivePacketSize", "()I", &[])
             .get_int()
-            .map(|i| if i > 0 { i as usize } else { Self::ARRAY_SIZE })
+            .map(|i| {
+                if i > 0 {
+                    let sz = i as usize;
+                    (Self::ARRAY_SIZE / sz) * sz
+                } else {
+                    Self::ARRAY_SIZE
+                }
+            })
             .unwrap_or(Self::ARRAY_SIZE);
 
         let mut vec_read = vec![0u8; read_size];
@@ -418,18 +439,23 @@ impl BluetoothSocket {
                 let tmp_read = unsafe {
                     std::slice::from_raw_parts_mut(vec_read.as_mut_ptr() as *mut i8, len)
                 };
-                env.get_byte_array_region(&array_read, 0, tmp_read)
+                env.get_byte_array_region(array_read, 0, tmp_read)
                     .map_err(jerr)?;
-                buf_read.lock().unwrap().write(&vec_read[..len]).unwrap();
-                read_callback.lock().unwrap()(Some(len));
+                buf_read
+                    .lock()
+                    .unwrap()
+                    .write_all(&vec_read[..len])
+                    .unwrap();
+                Self::read_callback(&read_callback, Some(len));
             } else {
                 if let Some(ex) = jni_last_cleared_ex() {
                     let ex_msg = ex.get_throwable_msg(env).unwrap().to_lowercase();
                     if ex_msg.contains("closed") {
+                        // Note: will it change in future Android versions?
                         let _ = env
                             .call_method(&socket, "close", "()V", &[])
                             .map_err(jni_clear_ex_ignore);
-                        read_callback.lock().unwrap()(None);
+                        Self::read_callback(&read_callback, None);
                         return Ok(());
                     }
                 }
@@ -438,9 +464,21 @@ impl BluetoothSocket {
                     .get_boolean()
                     .map_err(jerr)?;
                 if !is_connected {
-                    read_callback.lock().unwrap()(None);
+                    Self::read_callback(&read_callback, None);
                     return Ok(());
                 }
+            }
+        }
+    }
+
+    fn read_callback(cb: impl AsRef<Mutex<Option<ReadCallback>>>, val: Option<usize>) {
+        let mut lck = cb.as_ref().lock().unwrap();
+        if let Some(callback) = lck.take() {
+            drop(lck);
+            callback(val);
+            let mut lck = cb.as_ref().lock().unwrap();
+            if lck.is_none() {
+                lck.replace(callback);
             }
         }
     }
@@ -448,7 +486,7 @@ impl BluetoothSocket {
 
 impl Read for BluetoothSocket {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ok(0);
         }
 
@@ -486,7 +524,7 @@ impl Read for BluetoothSocket {
 
 impl Write for BluetoothSocket {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ok(0);
         }
 
@@ -531,9 +569,10 @@ impl Write for BluetoothSocket {
                 jerr(e)
             }
         })
-        .map(|_| buf.len()) // TODO: do some test to find possible size limit
+        .map(|_| buf.len())
     }
 
+    #[inline]
     fn flush(&mut self) -> std::io::Result<()> {
         let env = &mut jni_attach_vm().map_err(jerr)?;
         use jni::signature::*;
